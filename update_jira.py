@@ -6,93 +6,88 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 
-def read_required_environment_variable(name):
-    value = os.environ.get(
-        name,
-        "",
-    ).strip()
+def required_env(name):
+    value = os.environ.get(name, "").strip()
 
     if not value:
         raise RuntimeError(
-            f"Required environment variable "
-            f"{name} is missing."
+            f"Missing GitHub secret or environment variable: {name}"
         )
 
     return value
 
 
-def print_jira_error(response):
-    print("Jira response:")
+def print_response(response):
+    print(f"HTTP status: {response.status_code}")
 
     try:
-        body = response.json()
-
-        error_messages = body.get(
-            "errorMessages",
-            [],
-        )
-
-        field_errors = body.get(
-            "errors",
-            {},
-        )
-
-        for message in error_messages:
-            print(f" - {message}")
-
-        for field_id, message in (
-            field_errors.items()
-        ):
-            print(
-                f" - {field_id}: {message}"
+        print(
+            json.dumps(
+                response.json(),
+                indent=2,
             )
-
-        if not error_messages and not field_errors:
-            print(
-                json.dumps(
-                    body,
-                    indent=2,
-                )
-            )
-
+        )
     except ValueError:
-        print(response.text)
+        if response.text:
+            print(response.text)
+
+
+def request_or_fail(
+    method,
+    url,
+    auth,
+    headers,
+    operation,
+    **kwargs,
+):
+    response = requests.request(
+        method=method,
+        url=url,
+        auth=auth,
+        headers=headers,
+        timeout=30,
+        **kwargs,
+    )
+
+    if not response.ok:
+        print()
+        print(f"FAILED: {operation}")
+        print(f"Request URL: {url}")
+        print_response(response)
+
+        raise RuntimeError(
+            f"{operation} failed with "
+            f"HTTP {response.status_code}"
+        )
+
+    return response
 
 
 def main():
-    jira_url = read_required_environment_variable(
+    jira_url = required_env(
         "JIRA_URL"
     ).rstrip("/")
 
-    jira_email = (
-        read_required_environment_variable(
-            "JIRA_EMAIL"
-        )
+    jira_email = required_env(
+        "JIRA_EMAIL"
     )
 
-    jira_token = (
-        read_required_environment_variable(
-            "JIRA_TOKEN"
-        )
+    jira_token = required_env(
+        "JIRA_TOKEN"
     )
 
-    issue_key = (
-        read_required_environment_variable(
-            "ISSUE_KEY"
-        ).upper()
-    )
+    issue_key = required_env(
+        "ISSUE_KEY"
+    ).upper()
 
-    fields_json = (
-        read_required_environment_variable(
-            "FIELDS_JSON"
-        )
+    fields_json = required_env(
+        "FIELDS_JSON"
     )
 
     try:
         fields = json.loads(
             fields_json
         )
-
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             "FIELDS_JSON is not valid JSON."
@@ -100,15 +95,11 @@ def main():
 
     if not isinstance(fields, dict):
         raise RuntimeError(
-            "FIELDS_JSON must contain "
-            "a JSON object."
+            "FIELDS_JSON must be a JSON object."
         )
 
     if not fields:
-        print(
-            "No changed fields received."
-        )
-
+        print("No changed fields received.")
         sys.exit(0)
 
     auth = HTTPBasicAuth(
@@ -124,147 +115,85 @@ def main():
     print("=" * 70)
     print("JIRA UPDATE THROUGH GITHUB ACTIONS")
     print("=" * 70)
-    print(f"Issue: {issue_key}")
-    print()
 
+    print(f"Jira site: {jira_url}")
+    print(f"Jira account: {jira_email}")
+    print(f"Issue: {issue_key}")
+
+    print()
     print("Requested fields:")
 
     for field_id in fields:
         print(f" - {field_id}")
 
-    editmeta_url = (
-        f"{jira_url}"
-        f"/rest/api/3/issue/"
-        f"{issue_key}/editmeta"
+    # -------------------------------------------------
+    # Step 1: Validate authentication
+    # -------------------------------------------------
+
+    print()
+    print("Step 1: Validating Jira authentication...")
+
+    myself_url = (
+        f"{jira_url}/rest/api/3/myself"
     )
+
+    myself_response = request_or_fail(
+        method="GET",
+        url=myself_url,
+        auth=auth,
+        headers=headers,
+        operation="Jira authentication validation",
+    )
+
+    myself = myself_response.json()
+
+    print(
+        "Authenticated as: "
+        f"{myself.get('displayName', 'Unknown')}"
+    )
+
+    print(
+        "Account ID: "
+        f"{myself.get('accountId', 'Unknown')}"
+    )
+
+    # -------------------------------------------------
+    # Step 2: Validate issue visibility
+    # -------------------------------------------------
 
     print()
     print(
-        "Validating fields against "
-        "current Jira edit metadata..."
+        "Step 2: Checking whether the account "
+        "can view the Jira issue..."
     )
 
-    editmeta_response = requests.get(
-        editmeta_url,
-        headers=headers,
-        auth=auth,
-        timeout=30,
-    )
-
-    if not editmeta_response.ok:
-        print_jira_error(
-            editmeta_response
-        )
-
-        raise RuntimeError(
-            "Unable to retrieve current Jira "
-            "edit metadata. "
-            f"HTTP {editmeta_response.status_code}"
-        )
-
-    editable_fields = (
-        editmeta_response.json().get(
-            "fields",
-            {},
-        )
-    )
-
-    invalid_fields = []
-
-    unsupported_operation_fields = []
-
-    for field_id in fields:
-        metadata = editable_fields.get(
-            field_id
-        )
-
-        if metadata is None:
-            invalid_fields.append(
-                field_id
-            )
-
-            continue
-
-        operations = metadata.get(
-            "operations",
-            [],
-        )
-
-        if (
-            operations
-            and "set" not in operations
-        ):
-            unsupported_operation_fields.append(
-                field_id
-            )
-
-    if invalid_fields:
-        raise RuntimeError(
-            "These fields are no longer "
-            "editable for this issue: "
-            + ", ".join(invalid_fields)
-        )
-
-    if unsupported_operation_fields:
-        raise RuntimeError(
-            "These fields do not support the "
-            "set operation: "
-            + ", ".join(
-                unsupported_operation_fields
-            )
-        )
-
-    update_url = (
+    issue_url = (
         f"{jira_url}"
         f"/rest/api/3/issue/"
         f"{issue_key}"
     )
 
-    payload = {
-        "fields": fields,
-    }
-
-    print()
-    print(
-        "Editable-field validation passed."
-    )
-
-    print(
-        "Sending changed fields to Jira..."
-    )
-
-    response = requests.put(
-        update_url,
-        headers=headers,
+    issue_response = request_or_fail(
+        method="GET",
+        url=issue_url,
         auth=auth,
-        json=payload,
-        timeout=30,
+        headers=headers,
+        operation="Jira issue visibility check",
+        params={
+            "fields": "summary,status",
+        },
+    )
+
+    issue = issue_response.json()
+
+    print(
+        "Issue found: "
+        f"{issue.get('key')}"
     )
 
     print(
-        f"Jira HTTP status: "
-        f"{response.status_code}"
+        "Summary: "
+        f"{issue.get('fields', {}).get('summary')}"
     )
 
-    if response.status_code not in {
-        200,
-        204,
-    }:
-        print_jira_error(response)
-
-        raise RuntimeError(
-            "Jira update failed. "
-            f"HTTP {response.status_code}"
-        )
-
-    print()
-    print("=" * 70)
-    print(
-        f"SUCCESS: {issue_key} "
-        "was updated."
-    )
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()
+    # ------------------------------------
